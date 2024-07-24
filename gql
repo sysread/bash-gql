@@ -1,0 +1,715 @@
+#!/usr/bin/env bash
+
+set -eu -o pipefail
+
+usage() {
+  cat << EOF
+Usage: gql [OPTIONS]
+
+A script to interact with a GraphQL API.
+
+Options:
+  -h  | --help                    Display this help and exit.
+  -H  | --host <hostname>         Specify the GraphQL API host (default: stable-main).
+
+  -q  | --query <file>            Specify the GraphQL query/mutation file (location: $GQL_HOME/queries; outputs JSON).
+  -i  | --input <json>            JSON string containing input variables for the GraphQL query specified by --query.
+
+  -b  | --bearer <token>          Specify the bearer token to use for authentication (optional).
+
+  --schema                        Retrieve the entire GraphQL schema.
+  --refresh-schema                Refresh the GraphQL schema.
+
+  --types                         List all available types.
+  --mutations                     List all available mutations.
+  --queries                       List all available queries.
+
+  --docs <Identifier>             Get documentation for an identifier (type, query, or mutation).
+  --type-docs <TypeName>          Get documentation for a specific type.
+  --query-docs <QueryName>        Get documentation for a specific query.
+  --mutation-docs <MutationName>  Get documentation for a specific mutation.
+
+Examples:
+  gql --host myservice.com/gql --schema
+
+  # Oops, forgot to log in first! :D
+  gql --host myservice.com/gql --query login.gql --input '{"input": {"user": "someone", "password": "fnord"}}'
+  gql --host myservice.com/gql --refresh-schema
+  gql --host myservice.com/gql --schema
+
+  gql --host myservice.com/gql --mutations
+  gql --host myservice.com/gql --queries
+
+  gql --host myservice.com/gql --input-types
+  gql --host myservice.com/gql --output-types
+
+  gql --host myservice.com/gql --query-docs getSomeEntity
+  gql --host myservice.com/gql --mutation-docs createSomeEntity
+  gql --host myservice.com/gql --type-docs SomeEntity
+
+Caveats:
+  - assumes the presence of a GraphQL API endpoint at the specified host
+
+Required tools:
+  - jq
+  - curl
+  - gum ('brew install gum' or install from https://github.com/charmbracelet/gum)
+
+Environment:
+
+  GQL_HOME:   The directory where gql stores its configuration files (default: $HOME/.config/graphql)
+  GQL_HOST:   The hostname of the GraphQL API
+  GQL_BEARER: A bearer token string for an authorized user
+
+EOF
+}
+
+# ------------------------------------------------------------------------------
+# Validate required tools
+# ------------------------------------------------------------------------------
+if ! command -v jq &> /dev/null; then
+  echo "jq is required for JSON processing."
+  exit 1
+fi
+
+if ! command -v curl &> /dev/null; then
+  echo "curl is required for making HTTP requests."
+  exit 1
+fi
+
+if ! command -v gum &> /dev/null; then
+  echo "gum is required for text editing."
+  echo "Install it from https://github.com/charmbracelet/gum or using 'brew install gum'"
+  exit 1
+fi
+
+# ------------------------------------------------------------------------------
+# Globals
+# ------------------------------------------------------------------------------
+GQL_HOME="${GQL_HOME:-$HOME/.config/graphql}"
+GQL_HOST=
+GQL_BEARER=
+
+GQL_SCHEMA_FILE="$GQL_HOME/schema.json"
+GQL_QUERIES="$GQL_HOME/queries"
+
+actions=()
+query_file=""
+input_vars=""
+doc_term=""
+
+# ------------------------------------------------------------------------------
+# Configure the gum theme based on whether stdout is a terminal or not so we
+# don't dump ANSI codes to non-terminals.
+# ------------------------------------------------------------------------------
+if [ -t 1 ]; then
+  # If stdout is a terminal, use a dark theme by default
+  GUM_FORMAT_THEME=${GUM_FORMAT_THEME:-dark}
+else
+  # Otherwise, use a use notty so we don't spew ANSI codes to non-terminals
+  GUM_FORMAT_THEME='notty'
+fi
+
+# Ensure that subshell commands inherit the theme
+export GUM_FORMAT_THEME
+
+# ------------------------------------------------------------------------------
+# Create necessary directories and files
+# ------------------------------------------------------------------------------
+mkdir -p "$GQL_QUERIES"
+
+# ------------------------------------------------------------------------------
+# Functions
+# ------------------------------------------------------------------------------
+warn() {
+  echo "(gql:warn) $*" >&2
+}
+
+die() {
+  echo "(gql:fail) $*" >&2
+  exit 1
+}
+
+send_graphql_request() {
+  local graphql_endpoint="${GQL_HOST}"
+  local bearer_token=""
+  local bearer_token_header=""
+  local query_string
+  local json_payload
+
+  if [[ ! "$graphql_endpoint" =~ ^http ]]; then
+    graphql_endpoint="https://${graphql_endpoint}"
+  fi
+
+  if [ ! -f "$GQL_QUERIES/$query_file" ]; then
+    die "query file not found: $query_file"
+  else
+    query_string=$(cat "$GQL_QUERIES/$query_file")
+  fi
+
+  if [ -n "$GQL_BEARER" ]; then
+    bearer_token="$GQL_BEARER"
+    # shellcheck disable=SC2089
+    bearer_token_header="-H 'Authorization: Bearer $bearer_token'"
+  else
+    bearer_token="(not authenticated)"
+  fi
+
+  gum format << EOF >&2
+# Endpoint
+$graphql_endpoint
+
+# Bearer
+\`$bearer_token\`
+
+# Query
+\`\`\`graphql
+$query_string
+\`\`\`
+
+# Variables
+\`\`\`json
+$(jq '.' <<< "$input_vars")
+\`\`\`
+
+EOF
+
+  if gum confirm "Send GraphQL request?"; then
+    json_payload=$(\
+      jq -n \
+        --arg query "$query_string" \
+        --argjson vars "$input_vars" '{query: $query, variables: $vars}'
+      )
+
+    # shellcheck disable=SC2090,SC2086
+    curl -s -X POST \
+      -H "Content-Type: application/json" \
+      $bearer_token_header \
+      --data "$json_payload" \
+      "$graphql_endpoint"
+  else
+    echo "cancelled" >&2
+    exit 0
+  fi
+}
+
+get_schema() {
+  local force_refresh="${1:-false}"
+  local graphql_endpoint="${GQL_HOST}"
+  local bearer_token=""
+  local bearer_token_header=""
+  local query
+
+  if [[ ! "$graphql_endpoint" =~ ^http ]]; then
+    graphql_endpoint="https://${graphql_endpoint}"
+  fi
+
+  if [[ "$force_refresh" == "false" && -e "$GQL_SCHEMA_FILE" ]]; then
+    jq < "$GQL_SCHEMA_FILE"
+    return 0
+  fi
+
+  query="$(
+    cat << EOF
+{
+  "query": "query IntrospectionQuery {
+    __schema {
+      queryType {
+        name,
+        fields {
+          name,
+          args {
+            name,
+            description,
+            defaultValue,
+            type {
+              name,
+              kind,
+              ofType {
+                name,
+                kind
+              }
+            },
+          },
+          type {
+            name,
+            kind,
+            ofType {
+              name,
+              kind
+            }
+          },
+          isDeprecated,
+          deprecationReason
+        }
+      },
+      mutationType {
+        name,
+        fields {
+          name,
+          description,
+          args {
+            name,
+            description,
+            type {
+              name,
+              kind,
+              ofType {
+                name,
+                kind
+              }
+            }
+          },
+          type {
+            name,
+            kind,
+            ofType {
+              name,
+              kind
+            }
+          }
+        }
+      },
+      types {
+        ...FullType
+      }
+    }
+  }
+
+  fragment FullType on __Type {
+    kind,
+    name,
+    description,
+    fields(includeDeprecated: true) {
+      name,
+      description,
+      isDeprecated,
+      deprecationReason,
+      args {
+        ...InputValue
+      },
+      type {
+        ...TypeRef
+      },
+    },
+    inputFields {
+      ...InputValue
+    },
+    interfaces {
+      ...TypeRef
+    },
+    enumValues(includeDeprecated: true) {
+      name,
+      description,
+      isDeprecated,
+      deprecationReason
+    },
+    possibleTypes {
+      ...TypeRef
+    }
+  }
+
+  fragment InputValue on __InputValue {
+    name,
+    description,
+    defaultValue,
+    type {
+      ...TypeRef
+    }
+  }
+
+  fragment TypeRef on __Type {
+    kind,
+    name,
+    ofType {
+      kind,
+      name,
+      ofType {
+        kind,
+        name
+      }
+    }
+  }"
+}
+EOF
+  )"
+
+  if [ -n "$GQL_BEARER" ]; then
+    bearer_token="$GQL_BEARER"
+    # shellcheck disable=SC2089
+    bearer_token_header="-H 'Authorization: Bearer $bearer_token'"
+  else
+    warn "No bearer token found. Some queries may not work."
+  fi
+
+  # shellcheck disable=SC2090,SC2086
+  curl -s -X POST \
+    -H "Content-Type: application/json" \
+    $bearer_token_header \
+    --data "$query" \
+    "$graphql_endpoint" \
+    | tee >(jq '.' > "$GQL_SCHEMA_FILE") \
+    | jq '.'
+}
+
+list_mutations() {
+  get_schema \
+    | jq -r '.data.__schema.mutationType.fields[] | .name' \
+    | sort -u
+}
+
+list_queries() {
+  get_schema \
+    | jq -r '.data.__schema.queryType.fields[] | .name' \
+    | sort -u
+}
+
+list_types() {
+  get_schema \
+    | jq -r '.data.__schema.types[] | .name' \
+    | grep -v '^__' \
+    | sort -u
+}
+
+get_type_string() {
+  local field_json="$1"
+  local kind
+  local type
+
+  kind=$(jq -r '.type.kind' <<< "$field_json")
+  type=$(jq -r '.type.name' <<< "$field_json")
+
+  if [[ "$type" == "null" ]]; then
+    type=$(jq -r '.type.ofType.name' <<< "$field_json")
+
+    case "$kind" in
+      LIST)
+        echo "List of $type"
+        ;;
+
+      NON_NULL)
+        echo "$type (required)"
+        ;;
+
+      *)
+        echo "$type"
+        ;;
+    esac
+  else
+    echo "$type"
+  fi
+}
+
+print_fields_table() {
+  local label="$1"
+  local fields_json="$2"
+  local fields
+  local name
+  local type
+  local desc
+
+  if [[ $(jq '. | length' <<< "$fields_json") != "0" ]]; then
+    echo "| $label | Type | Description |"
+    echo "| --- | --- | --- |"
+
+    fields=$(jq -r '.[] | .name' <<< "$fields_json")
+
+    for name in $fields; do
+      desc=$(jq -r --arg name "$name" '.[] | select(.name == $name) | "\(.description // "-" | gsub("\n"; "<br>"))"' <<< "$fields_json")
+      type=$(get_type_string "$(jq -r --arg name "$name" '.[] | select(.name == $name)' <<< "$fields_json")")
+
+      echo "$name | $type | $desc"
+    done
+  else
+    echo "_None_"
+  fi
+}
+
+get_type_docs() {
+  local name="$doc_term"
+  local schema
+  local type_json
+  local kind
+  local desc
+
+  schema=$(get_schema)
+  type_json="$(jq -r --arg name "$name" '.data.__schema.types[] | select(.name == $name)' <<< "$schema")"
+
+  if [[ -z "$type_json" ]]; then
+    gum format -- "# Type $name" "_Not found_"
+    return 1
+  fi
+
+  kind=$(jq -r '.kind' <<< "$type_json")
+  desc=$(jq -r '.description' <<< "$type_json")
+
+  if [[ "$desc" == "null" ]]; then
+    desc=""
+  elif [[ -n "$desc" ]]; then
+    desc="_${desc}_"
+  fi
+
+  gum format -- "$(
+    cat << EOF
+# Type $name ($kind)
+
+$desc
+
+## Inputs
+$(print_fields_table "Input" "$(jq '.inputFields' <<< "$type_json")")
+
+## Outputs
+$(print_fields_table "Output" "$(jq '.fields' <<< "$type_json")")
+
+EOF
+  )"
+}
+
+get_query_docs() {
+  local name="$doc_term"
+  local schema
+  local query_json
+  local desc
+  local output_type
+  local output_type_json
+
+  schema=$(get_schema)
+  query_json=$(jq --arg name "$name" '.data.__schema.queryType.fields[] | select(.name == $name)' <<< "$schema")
+
+  if [[ -z "$query_json" ]]; then
+    gum format -- "# Query $name" "_Not found_"
+    return 1
+  fi
+
+  output_type=$(get_type_string "$query_json")
+  output_type_json=$(jq -r --arg name "$output_type" '.data.__schema.types[] | select(.name == $name)' <<< "$schema")
+
+  desc=$(jq -r '.description' <<< "$query_json")
+  if [[ "$desc" == "null" ]]; then
+    desc=""
+  elif [[ -n "$desc" ]]; then
+    desc="_${desc}_"
+  fi
+
+  gum format -- "$(
+    cat << EOF
+# Query $name
+
+$desc
+
+## Arguments
+$(print_fields_table "Input" "$(jq '.args' <<< "$query_json")")
+
+## Returns \`$output_type\`
+$(print_fields_table "Output" "$(jq '.fields' <<< "$output_type_json")")
+
+EOF
+  )"
+}
+
+get_mutation_docs() {
+  local name="$doc_term"
+  local schema
+  local query_json
+  local desc
+  local output_type
+  local output_type_json
+
+  schema=$(get_schema)
+  query_json=$(jq --arg name "$name" '.data.__schema.mutationType.fields[] | select(.name == $name)' <<< "$schema")
+
+  if [[ -z "$query_json" ]]; then
+    gum format -- "# Mutation $name" "_Not found_"
+    return 1
+  fi
+
+  output_type=$(get_type_string "$query_json")
+  output_type_json=$(jq -r --arg name "$output_type" '.data.__schema.types[] | select(.name == $name)' <<< "$schema")
+
+  desc=$(jq -r '.description' <<< "$query_json")
+  if [[ "$desc" == "null" ]]; then
+    desc=""
+  elif [[ -n "$desc" ]]; then
+    desc="_${desc}_"
+  fi
+
+  gum format -- "$(
+    cat << EOF
+# Mutation $name
+
+$desc
+
+## Arguments
+$(print_fields_table "Input" "$(jq '.args' <<< "$query_json")")
+
+## Returns \`$output_type\`
+$(print_fields_table "Output" "$(jq '.fields' <<< "$output_type_json")")
+
+EOF
+  )"
+}
+
+get_docs() {
+  get_type_docs || get_query_docs || get_mutation_docs
+}
+
+# ------------------------------------------------------------------------------
+# Parse Command Line Arguments
+# ------------------------------------------------------------------------------
+while (("$#")); do
+  case "$1" in
+    --help | -h)
+      usage
+      exit 0
+      ;;
+
+    --host | -H)
+      GQL_HOST="$2"
+      shift 2
+      ;;
+
+    --schema)
+      actions+=("get_schema")
+      shift
+      ;;
+
+    --refresh-schema)
+      actions+=("refresh_schema")
+      shift
+      ;;
+
+    --types)
+      actions+=("list_types")
+      shift
+      ;;
+
+    --mutations)
+      actions+=("list_mutations")
+      shift
+      ;;
+
+    --queries)
+      actions+=("list_queries")
+      shift
+      ;;
+
+    --docs)
+      if [[ " ${actions[*]} " == *" get_docs "* ]]; then
+        echo "Only one type can be specified for documentation at a time." >&2
+        exit 1
+      fi
+
+      actions+=("get_docs")
+      doc_term="$2"
+      shift 2
+      ;;
+
+    --type-docs)
+      if [[ " ${actions[*]} " == *" get_type_docs "* ]]; then
+        echo "Only one type can be specified for documentation at a time." >&2
+        exit 1
+      fi
+
+      actions+=("get_type_docs")
+      doc_term="$2"
+      shift 2
+
+      ;;
+
+    --query-docs)
+      if [[ " ${actions[*]} " == *" get_query_docs "* ]]; then
+        echo "Only one query can be specified for documentation at a time." >&2
+        exit 1
+      fi
+
+      actions+=("get_query_docs")
+      doc_term="$2"
+      shift 2
+      ;;
+
+    --mutation-docs)
+      if [[ " ${actions[*]} " == *" get_mutation_docs "* ]]; then
+        echo "Only one mutation can be specified for documentation at a time." >&2
+        exit 1
+      fi
+
+      actions+=("get_mutation_docs")
+      doc_term="$2"
+      shift 2
+      ;;
+
+    --query | -q)
+      if [[ " ${actions[*]} " == *" query "* ]]; then
+        echo "Only one query/mutation can be performed at a time." >&2
+        exit 1
+      fi
+
+      actions+=("query")
+
+      # Check if next argument exists and is not an option
+      if [[ -n "${2-}" && "${2-}" != -* ]]; then
+        query_file="$2"
+        shift 2
+      else
+        # If no file is specified or next argument is an option, use gum filter
+        query_file=$(find "$GQL_QUERIES" -type f -exec basename {} \; | gum filter --prompt "Filter queries or mutations:")
+        shift
+      fi
+
+      if [[ ! -f "$GQL_QUERIES/$query_file" ]]; then
+        echo "Invalid query file: $query_file" >&2
+        exit 1
+      fi
+      ;;
+
+    --input | -i)
+      input_vars="$2"
+
+      if ! echo "$input_vars" | jq . > /dev/null 2>&1; then
+        die "invalid JSON specified by --input"
+      fi
+
+      shift 2
+      ;;
+
+    --bearer | -b)
+      GQL_BEARER="$2"
+      shift 2
+      ;;
+
+    *)
+      echo "Invalid argument: $1" >&2
+      usage
+      exit 1
+      ;;
+  esac
+done
+
+if [[ -z "$GQL_HOST" ]]; then
+  echo "Error: --host is required"
+  usage
+fi
+
+if [[ "${#actions[@]}" -eq 0 ]]; then
+  echo "Error: No action(s) specified"
+  usage
+  exit 1
+fi
+
+for action in "${actions[@]}"; do
+  case "$action" in
+    get_schema) get_schema ;;
+    refresh_schema) get_schema "true" ;;
+    list_mutations) list_mutations ;;
+    list_queries) list_queries ;;
+    list_types) list_types ;;
+    get_docs) get_docs ;;
+    get_type_docs) get_type_docs ;;
+    get_query_docs) get_query_docs ;;
+    get_mutation_docs) get_mutation_docs ;;
+    query) send_graphql_request | jq ;;
+    *) usage ;;
+  esac
+done
+
+exit 0
