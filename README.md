@@ -25,6 +25,8 @@ Either clone the repo or save it directly.
 # USAGE
 
 ```
+gql --help
+
 gql --host myservice.com/gql --schema
 
 # Oops, forgot to log in first! :D
@@ -35,9 +37,7 @@ gql --host myservice.com/gql --refresh-schema
 
 gql --host myservice.com/gql --mutations
 gql --host myservice.com/gql --queries
-
-gql --host myservice.com/gql --input-types
-gql --host myservice.com/gql --output-types
+gql --host myservice.com/gql --types
 
 gql --host myservice.com/gql --query-docs getSomeEntity
 gql --host myservice.com/gql --mutation-docs createSomeEntity
