@@ -17,13 +17,16 @@ Options:
 
   -b  | --bearer <token>          Specify the bearer token to use for authentication (optional).
 
+  # Actions that output JSON
   --schema                        Retrieve the entire GraphQL schema.
   --refresh-schema                Refresh the GraphQL schema.
 
+  # Actions that output text
   --types                         List all available types.
   --mutations                     List all available mutations.
   --queries                       List all available queries.
 
+  # Actions that output markdown-formatted documentation
   --docs <Identifier>             Get documentation for an identifier (type, query, or mutation).
   --type-docs <TypeName>          Get documentation for a specific type.
   --query-docs <QueryName>        Get documentation for a specific query.
@@ -53,16 +56,33 @@ Caveats:
 Required tools:
   - jq
   - curl
+
+Optional tools:
   - gum ('brew install gum' or install from https://github.com/charmbracelet/gum)
 
 Environment:
-
   GQL_HOME:   The directory where gql stores its configuration files (default: $HOME/.config/graphql)
   GQL_HOST:   The hostname of the GraphQL API
   GQL_BEARER: A bearer token string for an authorized user
 
 EOF
 }
+
+# ------------------------------------------------------------------------------
+# Globals
+# ------------------------------------------------------------------------------
+GQL_HOME="${GQL_HOME:-$HOME/.config/graphql}"
+GQL_HOST=
+GQL_BEARER=
+
+GQL_SCHEMA_FILE="$GQL_HOME/schema.json"
+GQL_QUERIES="$GQL_HOME/queries"
+
+has_gum=false
+actions=()
+query_file=""
+input_vars=""
+doc_term=""
 
 # ------------------------------------------------------------------------------
 # Validate required tools
@@ -77,26 +97,10 @@ if ! command -v curl &> /dev/null; then
   exit 1
 fi
 
-if ! command -v gum &> /dev/null; then
-  echo "gum is required for text editing."
-  echo "Install it from https://github.com/charmbracelet/gum or using 'brew install gum'"
-  exit 1
+if command -v gum &> /dev/null; then
+  has_gum=true
+  has_gum=false
 fi
-
-# ------------------------------------------------------------------------------
-# Globals
-# ------------------------------------------------------------------------------
-GQL_HOME="${GQL_HOME:-$HOME/.config/graphql}"
-GQL_HOST=
-GQL_BEARER=
-
-GQL_SCHEMA_FILE="$GQL_HOME/schema.json"
-GQL_QUERIES="$GQL_HOME/queries"
-
-actions=()
-query_file=""
-input_vars=""
-doc_term=""
 
 # ------------------------------------------------------------------------------
 # Configure the gum theme based on whether stdout is a terminal or not so we
@@ -130,6 +134,26 @@ die() {
   exit 1
 }
 
+format() {
+  if [ "$has_gum" = true ]; then
+    gum format -- "$@"
+  else
+    echo "$@"
+  fi
+}
+
+confirm() {
+  local msg="$1"
+
+  if [ "$has_gum" = true ]; then
+    gum confirm "$msg"
+  else
+    echo "$msg"
+    read -r -p "Continue? [y/N] " response
+    [[ "$response" =~ ^([yY][eE][sS]|[yY])$ ]]
+  fi
+}
+
 send_graphql_request() {
   local graphql_endpoint="${GQL_HOST}"
   local bearer_token=""
@@ -155,7 +179,8 @@ send_graphql_request() {
     bearer_token="(not authenticated)"
   fi
 
-  gum format << EOF >&2
+  format "$(
+  cat << EOF >&2
 # Endpoint
 $graphql_endpoint
 
@@ -173,8 +198,9 @@ $(jq '.' <<< "$input_vars")
 \`\`\`
 
 EOF
+  )"
 
-  if gum confirm "Send GraphQL request?"; then
+  if confirm "Send GraphQL request?"; then
     json_payload=$(\
       jq -n \
         --arg query "$query_string" \
@@ -436,7 +462,7 @@ get_type_docs() {
   type_json="$(jq -r --arg name "$name" '.data.__schema.types[] | select(.name == $name)' <<< "$schema")"
 
   if [[ -z "$type_json" ]]; then
-    gum format -- "# Type $name" "_Not found_"
+    format "# Type $name" "_Not found_"
     return 1
   fi
 
@@ -449,7 +475,7 @@ get_type_docs() {
     desc="_${desc}_"
   fi
 
-  gum format -- "$(
+  format "$(
     cat << EOF
 # Type $name ($kind)
 
@@ -477,7 +503,7 @@ get_query_docs() {
   query_json=$(jq --arg name "$name" '.data.__schema.queryType.fields[] | select(.name == $name)' <<< "$schema")
 
   if [[ -z "$query_json" ]]; then
-    gum format -- "# Query $name" "_Not found_"
+    format "# Query $name" "_Not found_"
     return 1
   fi
 
@@ -491,7 +517,7 @@ get_query_docs() {
     desc="_${desc}_"
   fi
 
-  gum format -- "$(
+  format "$(
     cat << EOF
 # Query $name
 
@@ -519,7 +545,7 @@ get_mutation_docs() {
   query_json=$(jq --arg name "$name" '.data.__schema.mutationType.fields[] | select(.name == $name)' <<< "$schema")
 
   if [[ -z "$query_json" ]]; then
-    gum format -- "# Mutation $name" "_Not found_"
+    format "# Mutation $name" "_Not found_"
     return 1
   fi
 
@@ -533,7 +559,7 @@ get_mutation_docs() {
     desc="_${desc}_"
   fi
 
-  gum format -- "$(
+  format "$(
     cat << EOF
 # Mutation $name
 
@@ -650,10 +676,13 @@ while (("$#")); do
       if [[ -n "${2-}" && "${2-}" != -* ]]; then
         query_file="$2"
         shift 2
-      else
-        # If no file is specified or next argument is an option, use gum filter
+      elif [ "$has_gum" = true ]; then
+        # If gum is available, use it to filter queries
         query_file=$(find "$GQL_QUERIES" -type f -exec basename {} \; | gum filter --prompt "Filter queries or mutations:")
         shift
+      else
+        # Otherwise, error out
+        die "Query file not specified. It should the name of a file in $GQL_QUERIES."
       fi
 
       if [[ ! -f "$GQL_QUERIES/$query_file" ]]; then
@@ -687,13 +716,12 @@ done
 
 if [[ -z "$GQL_HOST" ]]; then
   echo "Error: --host is required"
-  usage
+  die "$(usage)"
 fi
 
 if [[ "${#actions[@]}" -eq 0 ]]; then
   echo "Error: No action(s) specified"
-  usage
-  exit 1
+  die "$(usage)"
 fi
 
 for action in "${actions[@]}"; do

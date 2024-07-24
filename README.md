@@ -12,6 +12,9 @@ the results, as well as to introspect the schema.
 
 - [`curl`](https://github.com/curl/curl)
 - [`jq`](https://github.com/jqlang/jq)
+
+# OPTIONAL
+
 - [`gum`](https://github.com/charmbracelet/gum)
 
 # INSTALL
